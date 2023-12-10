@@ -49,7 +49,8 @@ class OnPolicyRunner:
                  log_dir=None,
                  device='cpu'):
 
-        self.cfg = train_cfg["runner"]
+        # 初始化训练配置、算法配置、策略配置等
+        self.cfg=train_cfg["runner"]
         self.alg_cfg = train_cfg["algorithm"]
         self.policy_cfg = train_cfg["policy"]
         self.device = device
@@ -58,20 +59,28 @@ class OnPolicyRunner:
             num_critic_obs = self.env.num_privileged_obs 
         else:
             num_critic_obs = self.env.num_obs
-        actor_critic_class = eval(self.cfg["policy_class_name"])  # ActorCritic
+
+        # %%%%%% 根据配置文件中所指定的策略类名/算法类名/环境的观测和动作空间，动态选择并实例化对应的模型和算法 %%%%%%%%%%%%%%%%
+
+        # eval 函数用于执行字符串表达式，将字符串解释为 Python 表达式，并返回表达式的结果
+        # 在这里，它会将 self.cfg["policy_class_name"] 中的字符串转化为对应的类对象，并赋值给 actor_critic_class 变量用于后续的初始化
+        actor_critic_class = eval(self.cfg["policy_class_name"])  # 'ActorCritic'
         actor_critic: ActorCritic = actor_critic_class( self.env.num_obs,
                                                         num_critic_obs,
                                                         self.env.num_actions,
                                                         **self.policy_cfg).to(self.device)
-        alg_class = eval(self.cfg["algorithm_class_name"])  # PPO
+        alg_class = eval(self.cfg["algorithm_class_name"])  # 'PPO'
+        # self.alg 变量的预期类型是 PPO 类，'**self.alg_cfg' -> 使用字典中的键值对作为关键字参数
         self.alg: PPO = alg_class(actor_critic, device=self.device, **self.alg_cfg)
+
+        # 初始化一些训练过程中需要的参数
         self.num_steps_per_env = self.cfg["num_steps_per_env"]
         self.save_interval = self.cfg["save_interval"]
 
-        # init storage and model
+        # 初始化存储 RolloutStorage 类. 此处列表参数 [] 可能是为了未来的拓展性，即更容易处理不同的观察空间
         self.alg.init_storage(self.env.num_envs, self.num_steps_per_env, [self.env.num_obs], [self.env.num_privileged_obs], [self.env.num_actions])
 
-        # Log
+        # 初始化日志 Log
         self.log_dir = log_dir
         self.writer = None
         self.tot_timesteps = 0
@@ -81,16 +90,37 @@ class OnPolicyRunner:
         _, _ = self.env.reset()
     
     def learn(self, num_learning_iterations, init_at_random_ep_len=False):
-        # initialize writer
+        """
+        训练循环，包括数据采集（Rollout）和学习步骤.
+        在数据采集中，智能体通过与环境交互获得观测、奖励等信息，然后在学习阶段中使用这些信息进行策略更新.
+        日志记录和模型保存则用于监控和保存训练过程中的关键信息.
+
+        self.alg: PPO
+
+        - actor_critic.train() # switch to train mode
+        - act(obs, critic_obs)
+        - process_env_step(rewards, dones, infos)
+        - compute_returns(critic_obs)
+        - update()
+
+        :param num_learning_iterations: train_cfg.runner.max_iterations
+        :param init_at_random_ep_len: False
+        :return:
+        """
+        # 初始化 writer（用于 TensorBoard 日志记录）
         if self.log_dir is not None and self.writer is None:
             self.writer = SummaryWriter(log_dir=self.log_dir, flush_secs=10)
+
+        # 如果需要在随机的 episode 长度上初始化环境
         if init_at_random_ep_len:
             self.env.episode_length_buf = torch.randint_like(self.env.episode_length_buf, high=int(self.env.max_episode_length))
+
+        # 获取环境的初始观测
         obs = self.env.get_observations()
         privileged_obs = self.env.get_privileged_observations()
         critic_obs = privileged_obs if privileged_obs is not None else obs
         obs, critic_obs = obs.to(self.device), critic_obs.to(self.device)
-        self.alg.actor_critic.train()  # switch to train mode (for dropout for example)
+        self.alg.actor_critic.train() # switch to train mode (for dropout for example)
 
         ep_infos = []
         rewbuffer = deque(maxlen=100)
@@ -99,21 +129,37 @@ class OnPolicyRunner:
         cur_episode_length = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
 
         tot_iter = self.current_learning_iteration + num_learning_iterations
-        for it in range(self.current_learning_iteration, tot_iter):
+        for it in range(self.current_learning_iteration, tot_iter):  # 使用 load() 时，self.cli 可能非零
             start = time.time()
-            # Rollout
+            # 数据采集 Rollout
             with torch.inference_mode():
                 for i in range(self.num_steps_per_env):
-                    actions = self.alg.act(obs, critic_obs)  # infer actions
-                    obs, privileged_obs, rewards, dones, infos = self.env.step(actions)  # take a step in simulation
+                    # %%%%%% 智能体与环境交互 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+                    # 1. alg.act():
+                    #       - 每次交互智能体生成动作并将 actions, values, actions_log_prob, action_mean/sigma, obs 等
+                    #         信息记录到 transistion 中
+                    # 2. env.step():
+                    #       - 强化学习环境根据 actions 返回 obs, rewards, dones, infos 等信息
+                    # 3. alg.process_env_step():
+                    #       - 将 rewards, dones, info 等信息记录到 transition
+                    #       - 将当前 transition 添加到 RolloutStorage 类的实例 self.storage 中
+                    #       - 重置 (初始化) transition
+                    #       + transition 为 RolloutStorage 类的内部类 Transition 的实例
+                    # 4. 上述循环执行 self.num_steps_per_envs (num_transition_per_envs) 次后进入学习阶段
+                    #       - 此时 self.storage 包含了 num_steps_per_envs 个 transition
+                    #       + cfg 中默认 num_steps_per_env = 24
+                    actions = self.alg.act(obs, critic_obs)  # 生成动作并将信息记录到 transition 中
+                    obs, privileged_obs, rewards, dones, infos = self.env.step(actions)
                     critic_obs = privileged_obs if privileged_obs is not None else obs
                     obs, critic_obs, rewards, dones = obs.to(self.device), critic_obs.to(self.device), rewards.to(self.device), dones.to(self.device)
                     self.alg.process_env_step(rewards, dones, infos)
-                    
+
+                    # 处理日志信息
                     if self.log_dir is not None:
                         # Book keeping
                         if 'episode' in infos:
                             ep_infos.append(infos['episode'])
+                        # 记录当前累积奖励和累积步数，并将 dones=1 对应索引的环境的 cur_reward_sum, cur_episode_length 清零
                         cur_reward_sum += rewards
                         cur_episode_length += 1
                         new_ids = (dones > 0).nonzero(as_tuple=False)
@@ -123,26 +169,43 @@ class OnPolicyRunner:
                         cur_episode_length[new_ids] = 0
 
                 stop = time.time()
-                collection_time = stop - start
+                collection_time = stop - start  # 数据采集时间
 
-                # Learning step
+                # %%%%%% 开始学习阶段 Learning step %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+                # 1. alg.compute_returns():
+                #       - 根据 critic_obs 计算最新状态价值
+                #       - 调用 self.storage.compute_returns() 计算广义优势估计 GAE
                 start = stop
                 self.alg.compute_returns(critic_obs)
-            
+
+            # %%%%%% 策略更新 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+            # 1. self.alg.update():
+            #       - 从 self.storage 储存的 num_steps_per_envs 步长的数据池中生成小批量数据
+            #       - 计算 KL 散度
+            #       - 计算 loss: loss 由 surrogate_loss, value_loss, entropy_loss 组成
+            #       - 梯度反向传播, 裁减梯度, 优化器更新参数
             mean_value_loss, mean_surrogate_loss = self.alg.update()
             stop = time.time()
-            learn_time = stop - start
+            learn_time = stop - start  # 策略学习时间
             if self.log_dir is not None:
-                # locals() 函数会以字典类型返回当前位置的全部局部变量
+                #  log 方法可以访问并打印 learn 方法中的所有局部变量，其中 locals() 用于获取 learn 方法中的局部变量的字典
                 self.log(locals())
             if it % self.save_interval == 0:
+                # 每隔一定步数保存模型
                 self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(it)))
             ep_infos.clear()
         
         self.current_learning_iteration += num_learning_iterations
-        self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(self.current_learning_iteration)))
+        self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(self.current_learning_iteration)))  # 保存模型
 
     def log(self, locs, width=80, pad=35):
+        """ 记录和输出训练过程中的日志信息，包括各种损失值、性能指标、训练速度等
+
+        :param locs: locals() -> 获取 learn 方法中的局部变量的字典
+        :param width: 80
+        :param pad: 35
+        :return: None
+        """
         self.tot_timesteps += self.num_steps_per_env * self.env.num_envs
         self.tot_time += locs['collection_time'] + locs['learn_time']
         iteration_time = locs['collection_time'] + locs['learn_time']
@@ -212,14 +275,16 @@ class OnPolicyRunner:
         print(log_string)
 
     def save(self, path, infos=None):
+        """ 周期性地调用 self.save 方法，在训练过程中保存模型的状态字典、优化器状态字典、当前迭代次数等信息 """
         torch.save({
-            'model_state_dict': self.alg.actor_critic.state_dict(),
-            'optimizer_state_dict': self.alg.optimizer.state_dict(),
+            'model_state_dict': self.alg.actor_critic.state_dict(),  # 当前训练过程中策略和值函数网络的权重
+            'optimizer_state_dict': self.alg.optimizer.state_dict(),  # 当前优化器的状态，包括学习率等信息
             'iter': self.current_learning_iteration,
-            'infos': infos,
+            'infos': infos,  # 额外的信息，例如训练过程中的统计数据等
             }, path)
 
     def load(self, path, load_optimizer=True):
+        """ 加载保存的模型，可选择是否同时加载优化器状态 """
         loaded_dict = torch.load(path)
         self.alg.actor_critic.load_state_dict(loaded_dict['model_state_dict'])
         if load_optimizer:
@@ -228,6 +293,7 @@ class OnPolicyRunner:
         return loaded_dict['infos']
 
     def get_inference_policy(self, device=None):
+        """ 将模型切换到评估模式 eval() """
         self.alg.actor_critic.eval() # switch to evaluation mode (dropout for example)
         if device is not None:
             self.alg.actor_critic.to(device)

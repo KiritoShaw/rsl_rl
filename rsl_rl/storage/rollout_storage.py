@@ -35,6 +35,7 @@ from rsl_rl.utils import split_and_pad_trajectories
 
 class RolloutStorage:
     class Transition:
+        """ RolloutStorage 的内部类，用于存储一个 step 的数据 """
         def __init__(self):
             self.observations = None
             self.critic_observations = None
@@ -48,6 +49,7 @@ class RolloutStorage:
             self.hidden_states = None
         
         def clear(self):
+            """ 每次将当前 transition 添加到 rolloutstorage 之后执行该函数进行初始化 """
             self.__init__()
 
     def __init__(self, num_envs, num_transitions_per_env, obs_shape, privileged_obs_shape, actions_shape, device='cpu'):
@@ -86,12 +88,13 @@ class RolloutStorage:
         self.step = 0
 
     def add_transitions(self, transition: Transition):
+        """ 根据 self.step 将当前 transition 添加到对应存储张量的相应位置 """
         if self.step >= self.num_transitions_per_env:
             raise AssertionError("Rollout buffer overflow")
         self.observations[self.step].copy_(transition.observations)
         if self.privileged_observations is not None: self.privileged_observations[self.step].copy_(transition.critic_observations)
         self.actions[self.step].copy_(transition.actions)
-        self.rewards[self.step].copy_(transition.rewards.view(-1, 1))
+        self.rewards[self.step].copy_(transition.rewards.view(-1, 1))  # view(-1, 1) 是为确保张量的形状是列向量
         self.dones[self.step].copy_(transition.dones.view(-1, 1))
         self.values[self.step].copy_(transition.values)
         self.actions_log_prob[self.step].copy_(transition.actions_log_prob.view(-1, 1))
@@ -121,8 +124,32 @@ class RolloutStorage:
         self.step = 0
 
     def compute_returns(self, last_values, gamma, lam):
+        """ 计算 GAE 用于平衡 TD 和 MC，也用于平衡偏差和方差
+
+        TD(1): A(t, 1) = delta(t)
+                       = rew(t) + gamma*V(t+1) - V(t) >>> {时序差分误差}
+        TD(2): A(t, 2) = delta(t) + gamma*delta(t+1)
+                       = rew(t) + gamma*rew(t+1) + gamma^2*rew(t+2) - V(t)
+        TD(3): A(t, 3) = delta(t) + gamma*delta(t+1) + gamma^2*delta(t+1)
+                       = rew(t) + gamma*rew(t+1) + gamma^2*rew(t+2) + gamma^3*rew(t+3) - V(t)
+        ...
+        MC: A(t, inf) = delta(t) + gamma*delta(t+1) + gamma^2*delta(t+1) + ...
+
+        Calculation:
+            GAE = A(t, 1~inf) 的加权平均 = (1 - lam)*[A(1) + (lam*gamma)*A(2) + (lam*gamma)^2*A(3) + ...]
+
+        Iteration:
+            advantage(T) = delta(T) = r(T) + V(last) - V(T)
+            advantage(T-1) = delta(T-1) + lam*gamma*delta(T) = delta(T-1) + lam*gamma*advantage(T)
+            ...
+
+        :param last_values:
+        :param gamma: 折现因子
+        :param lam: GAE 超参数
+        :return: None
+        """
         advantage = 0
-        for step in reversed(range(self.num_transitions_per_env)):
+        for step in reversed(range(self.num_transitions_per_env)):  # 从后往前计算
             if step == self.num_transitions_per_env - 1:
                 next_values = last_values
             else:
@@ -137,16 +164,29 @@ class RolloutStorage:
         self.advantages = (self.advantages - self.advantages.mean()) / (self.advantages.std() + 1e-8)
 
     def get_statistics(self):
+        """ 返回轨迹的长度和平均奖励 """
         done = self.dones
-        done[-1] = 1
+        done[-1] = 1  # 将最后一个时间步标记为终止状态，确保轨迹被完整处理
+        # -> [num_envs, num_transition_per_envs, 1] -> [num_envs * num_transition_per_envs, 1]
         flat_dones = done.permute(1, 0, 2).reshape(-1, 1)
-        done_indices = torch.cat((flat_dones.new_tensor([-1], dtype=torch.int64), flat_dones.nonzero(as_tuple=False)[:, 0]))
+        # 增加 [-1] 以确保正常计算
+        done_indices = torch.cat((flat_dones.new_tensor([-1], dtype=torch.int64),
+                                  flat_dones.nonzero(as_tuple=False)[:, 0]))
         trajectory_lengths = (done_indices[1:] - done_indices[:-1])
         return trajectory_lengths.float().mean(), self.rewards.mean()
 
     def mini_batch_generator(self, num_mini_batches, num_epochs=8):
-        batch_size = self.num_envs * self.num_transitions_per_env
-        mini_batch_size = batch_size // num_mini_batches
+        """  生成用于训练的小批量数据
+
+        :param num_mini_batches:
+        :param num_epochs:
+        :return: yield [obs_batch, critic_observations_batch, actions_batch, target_values_batch, advantages_batch,
+                        returns_batch, old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, (None, None), None]
+        """
+        # randperm() 创建了一个包含 [0, 1, ..., num_mini_batches*mini_batch_size-1] 打乱顺序的整数索引的张量 indices
+        # indices 的长度小于等于 batch_size 数值，目的是在每个训练周期内从整个数据集中随机选择小批量数据
+        batch_size = self.num_envs * self.num_transitions_per_env  # 默认 cfg: num_envs=4096, num_transitions_per_env=24
+        mini_batch_size = batch_size // num_mini_batches  # 默认 cfg: num_mini_batchs=4
         indices = torch.randperm(num_mini_batches*mini_batch_size, requires_grad=False, device=self.device)
 
         observations = self.observations.flatten(0, 1)
@@ -155,7 +195,8 @@ class RolloutStorage:
         else:
             critic_observations = observations
 
-        actions = self.actions.flatten(0, 1)
+        # 将张量按 0,1 维度展平
+        actions = self.actions.flatten(0, 1)  # [num_transitions_per_env * num_envs, *actions_shape]
         values = self.values.flatten(0, 1)
         returns = self.returns.flatten(0, 1)
         old_actions_log_prob = self.actions_log_prob.flatten(0, 1)
@@ -179,8 +220,9 @@ class RolloutStorage:
                 advantages_batch = advantages[batch_idx]
                 old_mu_batch = old_mu[batch_idx]
                 old_sigma_batch = old_sigma[batch_idx]
-                yield obs_batch, critic_observations_batch, actions_batch, target_values_batch, advantages_batch, returns_batch, \
-                       old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, (None, None), None
+                yield obs_batch, critic_observations_batch, actions_batch,\
+                      target_values_batch, advantages_batch, returns_batch, \
+                      old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, (None, None), None
 
     # for RNNs only
     def reccurent_mini_batch_generator(self, num_mini_batches, num_epochs=8):

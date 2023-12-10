@@ -49,14 +49,15 @@ class ActorCritic(nn.Module):
             print("ActorCritic.__init__ got unexpected arguments, which will be ignored: " + str([key for key in kwargs.keys()]))
         super(ActorCritic, self).__init__()
 
-        activation = get_activation(activation)
+        activation = get_activation(activation)  # 选择配置文件所指定的 activation function
 
         mlp_input_dim_a = num_actor_obs
         mlp_input_dim_c = num_critic_obs
 
-        # Policy
+        # %%%%%% Policy network: MLP %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
         actor_layers = []
-        actor_layers.append(nn.Linear(mlp_input_dim_a, actor_hidden_dims[0]))
+        actor_layers.append(nn.Linear(mlp_input_dim_a, actor_hidden_dims[0]))  # observation 的最后一维与 mlp_input_dim_a 相同即可
         actor_layers.append(activation)
         for l in range(len(actor_hidden_dims)):
             if l == len(actor_hidden_dims) - 1:
@@ -64,9 +65,11 @@ class ActorCritic(nn.Module):
             else:
                 actor_layers.append(nn.Linear(actor_hidden_dims[l], actor_hidden_dims[l + 1]))
                 actor_layers.append(activation)
+        # 将 actor_layers 中的层按照顺序添加到 self.actor 中，构建了整个 Actor 网络的前向传播过程
         self.actor = nn.Sequential(*actor_layers)
 
-        # Value function
+        # %%%%%% Value function: MLP %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
         critic_layers = []
         critic_layers.append(nn.Linear(mlp_input_dim_c, critic_hidden_dims[0]))
         critic_layers.append(activation)
@@ -114,17 +117,21 @@ class ActorCritic(nn.Module):
     
     @property
     def entropy(self):
+        """ 计算熵 """
         return self.distribution.entropy().sum(dim=-1)
 
     def update_distribution(self, observations):
-        mean = self.actor(observations)
+        """ 获取策略网络的输出动作的分布 """
+        mean = self.actor(observations)  # 对 Actor 网络进行前向传播
         self.distribution = Normal(mean, mean*0. + self.std)
 
     def act(self, observations, **kwargs):
+        """ 从更新后的策略分布中采样动作得到具体的动作 """
         self.update_distribution(observations)
         return self.distribution.sample()
     
     def get_actions_log_prob(self, actions):
+        """ 计算给定动作 actions 的对数概率 """
         return self.distribution.log_prob(actions).sum(dim=-1)
 
     def act_inference(self, observations):
@@ -132,6 +139,7 @@ class ActorCritic(nn.Module):
         return actions_mean
 
     def evaluate(self, critic_observations, **kwargs):
+        """ 计算状态值函数 """
         value = self.critic(critic_observations)
         return value
 
