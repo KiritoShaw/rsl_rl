@@ -28,7 +28,25 @@
 #
 # Copyright (c) 2021 ETH Zurich, Nikita Rudin
 
+"""
+Logs
+----
+2023.12.22:
+    新增函数 create_folders
+
+"""
+
 import torch
+import os
+
+def create_folders(root_dir, names):
+    dir_dict = {}
+    for name in names:
+        temp_path = os.path.join(root_dir, name)
+        if not os.path.exists(temp_path):
+            os.makedirs(temp_path)
+        dir_dict[name] = temp_path
+    return dir_dict
 
 def split_and_pad_trajectories(tensor, dones):
     """ Splits trajectories at done indices. Then concatenates them and padds with zeros up to the length og the longest trajectory.

@@ -116,7 +116,7 @@ class PPO:
         self.actor_critic.reset(dones)
     
     def compute_returns(self, last_critic_obs):
-        """ (学习阶段) 使用 GAE 来估计每个状态的优势值，用于计算策略梯度 """
+        """ (学习阶段) 计算 GAE 和回报 """
         last_values= self.actor_critic.evaluate(last_critic_obs).detach()
         self.storage.compute_returns(last_values, self.gamma, self.lam)
 
@@ -184,7 +184,7 @@ class PPO:
                     value_losses_clipped = (value_clipped - returns_batch).pow(2)
                     value_loss = torch.max(value_losses, value_losses_clipped).mean()
                 else:
-                    value_loss = (returns_batch - value_batch).pow(2).mean()  # returns_batch 通过 GAE 计算
+                    value_loss = (returns_batch - value_batch).pow(2).mean()
 
                 # %%%%%% Total loss %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
                 # 最终损失由三部分构成

@@ -30,6 +30,7 @@
 
 import time
 import os
+import json
 from collections import deque
 import statistics
 
@@ -37,8 +38,9 @@ from torch.utils.tensorboard import SummaryWriter
 import torch
 
 from rsl_rl.algorithms import PPO
-from rsl_rl.modules import ActorCritic, ActorCriticRecurrent
+from rsl_rl.modules import ActorCritic, ActorCriticRecurrent, ActorCriticEncoder
 from rsl_rl.env import VecEnv
+from rsl_rl.utils import create_folders
 
 
 class OnPolicyRunner:
@@ -46,15 +48,19 @@ class OnPolicyRunner:
     def __init__(self,
                  env: VecEnv,
                  train_cfg,
+                 env_cfg,
                  log_dir=None,
                  device='cpu'):
 
         # 初始化训练配置、算法配置、策略配置等
-        self.cfg=train_cfg["runner"]
+        self.cfg = train_cfg["runner"]
         self.alg_cfg = train_cfg["algorithm"]
         self.policy_cfg = train_cfg["policy"]
+        self.encoder_cfg = train_cfg['encoder'] if 'encoder' in train_cfg else {}
         self.device = device
         self.env = env
+        self.env_cfg = env_cfg
+        self.train_cfg = train_cfg
         if self.env.num_privileged_obs is not None:
             num_critic_obs = self.env.num_privileged_obs 
         else:
@@ -65,10 +71,12 @@ class OnPolicyRunner:
         # eval 函数用于执行字符串表达式，将字符串解释为 Python 表达式，并返回表达式的结果
         # 在这里，它会将 self.cfg["policy_class_name"] 中的字符串转化为对应的类对象，并赋值给 actor_critic_class 变量用于后续的初始化
         actor_critic_class = eval(self.cfg["policy_class_name"])  # 'ActorCritic'
-        actor_critic: ActorCritic = actor_critic_class( self.env.num_obs,
-                                                        num_critic_obs,
-                                                        self.env.num_actions,
-                                                        **self.policy_cfg).to(self.device)
+        actor_critic: ActorCritic = actor_critic_class(self.env_cfg,
+                                                       self.env.num_obs,
+                                                       num_critic_obs,
+                                                       self.env.num_actions,
+                                                       **self.policy_cfg,
+                                                       **self.encoder_cfg).to(self.device)
         alg_class = eval(self.cfg["algorithm_class_name"])  # 'PPO'
         # self.alg 变量的预期类型是 PPO 类，'**self.alg_cfg' -> 使用字典中的键值对作为关键字参数
         self.alg: PPO = alg_class(actor_critic, device=self.device, **self.alg_cfg)
@@ -77,7 +85,7 @@ class OnPolicyRunner:
         self.num_steps_per_env = self.cfg["num_steps_per_env"]
         self.save_interval = self.cfg["save_interval"]
 
-        # 初始化存储 RolloutStorage 类. 此处列表参数 [] 可能是为了未来的拓展性，即更容易处理不同的观察空间
+        # 初始化存储 RolloutStorage 类. 此处列表参数 [] 是为了可拓展性，即更容易处理不同的观察空间
         self.alg.init_storage(self.env.num_envs, self.num_steps_per_env, [self.env.num_obs], [self.env.num_privileged_obs], [self.env.num_actions])
 
         # 初始化日志 Log
@@ -92,6 +100,7 @@ class OnPolicyRunner:
     def learn(self, num_learning_iterations, init_at_random_ep_len=False):
         """
         训练循环，包括数据采集（Rollout）和学习步骤.
+        训练开始之前创建文件夹 task&config/tensorboard 并将训练参数保存至相应文件夹中 (2023.12.22)
         在数据采集中，智能体通过与环境交互获得观测、奖励等信息，然后在学习阶段中使用这些信息进行策略更新.
         日志记录和模型保存则用于监控和保存训练过程中的关键信息.
 
@@ -107,13 +116,24 @@ class OnPolicyRunner:
         :param init_at_random_ep_len: False
         :return:
         """
+        # 新建文件夹 create folders
+        dir_names = ['tensorboard', 'task&config']
+        dir_dict = create_folders(self.log_dir, dir_names)
+
         # 初始化 writer（用于 TensorBoard 日志记录）
         if self.log_dir is not None and self.writer is None:
-            self.writer = SummaryWriter(log_dir=self.log_dir, flush_secs=10)
+            self.writer = SummaryWriter(log_dir=dir_dict['tensorboard'], flush_secs=10)
+            # self.writer = SummaryWriter(log_dir=self.log_dir, flush_secs=10)
 
         # 如果需要在随机的 episode 长度上初始化环境
         if init_at_random_ep_len:
             self.env.episode_length_buf = torch.randint_like(self.env.episode_length_buf, high=int(self.env.max_episode_length))
+
+        # 保存 cfg 到指定文件夹
+        with open(os.path.join(dir_dict['task&config'], 'env_config.json'), 'w') as f:
+            f.write(json.dumps(self.env_cfg, sort_keys=False, indent=4, separators=(',', ': ')))
+        with open(os.path.join(dir_dict['task&config'], 'train_config.json'), 'w') as f:
+            f.write(json.dumps(self.train_cfg, sort_keys=False, indent=4, separators=(',', ': ')))
 
         # 获取环境的初始观测
         obs = self.env.get_observations()

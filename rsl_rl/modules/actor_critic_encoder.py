@@ -35,29 +35,52 @@ import torch.nn as nn
 from torch.distributions import Normal
 from torch.nn.modules import rnn
 
-
-class ActorCritic(nn.Module):
+class ActorCriticEncoder(nn.Module):
     is_recurrent = False
-
-    def __init__(self,
-                 env_cfg,
-                 num_actor_obs,
-                 num_critic_obs,
-                 num_actions,
-                 actor_hidden_dims=[256, 256, 256],
-                 critic_hidden_dims=[256, 256, 256],
-                 activation='elu',
-                 init_noise_std=1.0,
-                 **kwargs):
+    def __init__(self,  env_cfg,
+                        num_actor_obs,
+                        num_critic_obs,
+                        num_actions,
+                        actor_hidden_dims=[256, 256, 256],
+                        critic_hidden_dims=[256, 256, 256],
+                        activation='elu',
+                        init_noise_std=1.0,
+                        is_teacher=True,
+                        mlp_input_dim=None,
+                        mlp_output_dim=None,
+                        mlp_hidden_dims=[256, 256, 256],
+                        **kwargs):
         if kwargs:
             print("ActorCritic.__init__ got unexpected arguments, which will be ignored: " + str([key for key in kwargs.keys()]))
-        super(ActorCritic, self).__init__()
+        super(ActorCriticEncoder, self).__init__()
 
         activation = get_activation(activation)  # 选择配置文件所指定的 activation function
 
+        self.is_teacher = is_teacher
+        self.num_base_obs = num_base_obs = env_cfg["env"]["num_base_obs"]
+        self.num_height_obs = num_height_obs = env_cfg["env"]["num_height_obs"]
+        self.num_extrinsic_obs = num_extrinsic_obs = env_cfg["env"]["num_extrinsic_obs"]
+        
+        self.get_base_obs = lambda obs: obs[:, :num_base_obs]
+        self.get_height_obs = lambda obs: obs[:, num_base_obs:num_base_obs+num_height_obs]
+        self.get_extrinsic_obs = lambda obs: obs[:, num_base_obs+num_height_obs:num_base_obs+num_height_obs+num_extrinsic_obs]
+
+        # %%%%%% Encoder network: MLP %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+        encoder_layers = []
+        encoder_layers.append(nn.Linear(mlp_input_dim, mlp_hidden_dims[0]))
+        encoder_layers.append(activation)
+        for l in range(len(mlp_hidden_dims)):
+            if l == len(mlp_hidden_dims) - 1:
+                encoder_layers.append(nn.Linear(mlp_hidden_dims[l], mlp_output_dim))
+            else:
+                encoder_layers.append(nn.Linear(mlp_hidden_dims[l], mlp_hidden_dims[l + 1]))
+                encoder_layers.append(activation)
+        self.encoder = nn.Sequential(*encoder_layers)
+        
         # %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
-        mlp_input_dim_a = num_actor_obs
+        mlp_input_dim_a = env_cfg["env"]["num_base_obs"] + env_cfg["env"]["num_latent"]
         mlp_input_dim_c = num_critic_obs
 
         # %%%%%% Policy network: MLP %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
@@ -87,6 +110,7 @@ class ActorCritic(nn.Module):
                 critic_layers.append(activation)
         self.critic = nn.Sequential(*critic_layers)
 
+        print(f"Encoder MLP: {self.encoder}")
         print(f"Actor MLP: {self.actor}")
         print(f"Critic MLP: {self.critic}")
 
@@ -131,18 +155,42 @@ class ActorCritic(nn.Module):
         mean = self.actor(observations)  # 对 Actor 网络进行前向传播
         self.distribution = Normal(mean, mean*0. + self.std)
 
+    def act_teacher(self, observations, **kwargs):
+        """ 执行 teacher 网络输出的动作 """
+        base_obs = self.get_base_obs(observations)
+        height_obs = self.get_height_obs(observations)
+        extrinsic_obs = self.get_extrinsic_obs(observations)
+        latent = self.encoder(torch.cat((height_obs, extrinsic_obs), dim=-1))
+        actor_input_obs = torch.cat((base_obs, latent), dim=-1)
+        self.update_distribution(actor_input_obs)
+        return self.distribution.sample()
+
+    def act_student(self, observations, **kwargs):
+        """ 执行 student 网络输出的动作 """
+        base_obs = observations[:, -self.num_base_obs:]
+        latent = self.encoder(observations)
+        actor_input_obs = torch.cat((base_obs, latent), dim=-1)
+        return self.actor(actor_input_obs), latent
+
     def act(self, observations, **kwargs):
         """ 从更新后的策略分布中采样动作得到具体的动作 """
-        self.update_distribution(observations)
-        return self.distribution.sample()
+        if self.is_teacher:
+            return self.act_teacher(observations, **kwargs)
+        else:
+            return self.act_student(observations, **kwargs)
     
     def get_actions_log_prob(self, actions):
         """ 计算给定动作 actions 的对数概率 """
         return self.distribution.log_prob(actions).sum(dim=-1)
 
     def act_inference(self, observations):
-        actions_mean = self.actor(observations)
-        return actions_mean, None
+        base_obs = self.get_base_obs(observations)
+        height_obs = self.get_height_obs(observations)
+        extrinsic_obs = self.get_extrinsic_obs(observations)
+        latent = self.encoder(torch.cat((height_obs, extrinsic_obs), dim=-1))
+        actor_input_obs = torch.cat((base_obs, latent), dim=-1)
+        actions_mean = self.actor(actor_input_obs)
+        return actions_mean, latent
 
     def evaluate(self, critic_observations, **kwargs):
         """ 计算状态值函数 """

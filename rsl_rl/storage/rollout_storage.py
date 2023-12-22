@@ -143,6 +143,9 @@ class RolloutStorage:
             advantage(T-1) = delta(T-1) + lam*gamma*delta(T) = delta(T-1) + lam*gamma*advantage(T)
             ...
 
+        delta: 即时奖励 + 下一个状态的价值 - 当前状态的价值
+        advantage: 
+        
         :param last_values:
         :param gamma: 折现因子
         :param lam: GAE 超参数
@@ -183,10 +186,11 @@ class RolloutStorage:
         :return: yield [obs_batch, critic_observations_batch, actions_batch, target_values_batch, advantages_batch,
                         returns_batch, old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, (None, None), None]
         """
+        # 默认 cfg: num_envs=4096, num_transitions_per_env=24, num_mini_batchs=4
         # randperm() 创建了一个包含 [0, 1, ..., num_mini_batches*mini_batch_size-1] 打乱顺序的整数索引的张量 indices
         # indices 的长度小于等于 batch_size 数值，目的是在每个训练周期内从整个数据集中随机选择小批量数据
-        batch_size = self.num_envs * self.num_transitions_per_env  # 默认 cfg: num_envs=4096, num_transitions_per_env=24
-        mini_batch_size = batch_size // num_mini_batches  # 默认 cfg: num_mini_batchs=4
+        batch_size = self.num_envs * self.num_transitions_per_env
+        mini_batch_size = batch_size // num_mini_batches
         indices = torch.randperm(num_mini_batches*mini_batch_size, requires_grad=False, device=self.device)
 
         observations = self.observations.flatten(0, 1)
